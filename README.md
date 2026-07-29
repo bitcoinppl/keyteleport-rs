@@ -1,7 +1,8 @@
+WIP DO NOT USE
+
 # keyteleport
 
-`keyteleport` implements the parts of the
-[COLDCARD Key Teleport protocol](https://github.com/Coldcard/firmware/blob/master/docs/key-teleport.md)
+`keyteleport` implements the parts of the [COLDCARD Key Teleport protocol](https://github.com/Coldcard/firmware/blob/master/docs/key-teleport.md)
 that Cove uses.
 
 ## Support
