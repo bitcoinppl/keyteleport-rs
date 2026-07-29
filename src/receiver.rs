@@ -1,13 +1,84 @@
-use bitcoin::secp256k1::PublicKey;
-use zeroize::{Zeroize as _, Zeroizing};
+use std::fmt;
+
+use bitcoin::secp256k1::{PublicKey, SecretKey};
+use zeroize::Zeroizing;
 
 use crate::{
-    DecodedPayload, Error, NumericCode, ReceiverPacket, Result, SenderPacket, TeleportPassword,
+    DecryptedPayload, Error, NumericCode, Payload, ReceiverPacket, Result, SenderPacket,
+    TeleportPassword,
     crypto::{self, EphemeralPrivateKey, SessionKey},
-    payload::Payload,
 };
 
-/// A receiver-side KeyTeleport session
+/// A zeroizing receiver-session secret used for persistence
+#[derive(Clone, PartialEq, Eq)]
+pub struct ReceiverSessionSecret(Zeroizing<[u8; 32]>);
+
+impl ReceiverSessionSecret {
+    /// Validates receiver private-key bytes
+    pub fn from_bytes(bytes: [u8; 32]) -> Result<Self> {
+        let bytes = Zeroizing::new(bytes);
+        SecretKey::from_slice(bytes.as_ref())?;
+
+        Ok(Self(bytes))
+    }
+
+    /// Exposes the receiver private-key bytes for protected persistence
+    pub fn expose_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+impl fmt::Debug for ReceiverSessionSecret {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ReceiverSessionSecret(****)")
+    }
+}
+
+/// A failed operation that returns its state for another attempt
+pub struct RetryableError<S> {
+    state: Box<S>,
+    error: Error,
+}
+
+impl<S> RetryableError<S> {
+    fn new(state: S, error: Error) -> Self {
+        Self { state: Box::new(state), error }
+    }
+
+    /// Returns the protocol error
+    pub fn error(&self) -> &Error {
+        &self.error
+    }
+
+    /// Returns the reusable protocol state
+    pub fn state(&self) -> &S {
+        &self.state
+    }
+
+    /// Returns the reusable state and protocol error
+    pub fn into_parts(self) -> (S, Error) {
+        (*self.state, self.error)
+    }
+}
+
+impl<S: fmt::Debug> fmt::Debug for RetryableError<S> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RetryableError")
+            .field("state", &self.state)
+            .field("error", &self.error)
+            .finish()
+    }
+}
+
+impl<S> fmt::Display for RetryableError<S> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.error.fmt(f)
+    }
+}
+
+impl<S: fmt::Debug> std::error::Error for RetryableError<S> {}
+
+/// A receiver-side Key Teleport session
 #[derive(Debug)]
 pub struct ReceiverSession {
     private_key: EphemeralPrivateKey,
@@ -19,14 +90,16 @@ impl ReceiverSession {
         Self { private_key: EphemeralPrivateKey::generate() }
     }
 
-    /// Restores a receiver session from its ephemeral private key
-    pub fn from_private_key_bytes(bytes: [u8; 32]) -> Result<Self> {
-        Ok(Self { private_key: EphemeralPrivateKey::from_bytes(bytes)? })
+    /// Restores a receiver session from a protected secret
+    pub fn from_secret(secret: ReceiverSessionSecret) -> Result<Self> {
+        let private_key = EphemeralPrivateKey::from_bytes(*secret.expose_bytes())?;
+
+        Ok(Self { private_key })
     }
 
-    /// Returns the ephemeral private key bytes for session persistence
-    pub fn private_key_bytes(&self) -> [u8; 32] {
-        self.private_key.expose_bytes()
+    /// Exports a zeroizing secret for protected session persistence
+    pub fn export_secret(&self) -> ReceiverSessionSecret {
+        ReceiverSessionSecret(Zeroizing::new(self.private_key.expose_bytes()))
     }
 
     /// Creates the receiver request to share with a sender
@@ -36,22 +109,24 @@ impl ReceiverSession {
         Ok(ReceiveRequest { numeric_code, packet: ReceiverPacket::new(payload.to_vec())? })
     }
 
-    /// Decrypts the outer layer of a sender packet
-    pub fn decode_step1(&self, packet: &SenderPacket) -> Result<PendingPayload> {
-        let sender_pubkey = PublicKey::from_slice(packet.sender_pubkey_bytes())?;
-        let session_key = self.private_key.session_key(&sender_pubkey);
-        let inner = session_key.decrypt_outer(packet.encrypted_body())?;
-
-        Ok(PendingPayload { session_key, inner })
-    }
-
-    /// Decrypts and decodes a sender packet
-    pub fn decode(
-        &self,
+    /// Decrypts the outer sender-packet layer and consumes the active session
+    ///
+    /// A failure returns the session in [`RetryableError`] so the caller can try another packet
+    pub fn decode_step1(
+        self,
         packet: &SenderPacket,
-        password: &TeleportPassword,
-    ) -> Result<DecodedPayload> {
-        self.decode_step1(packet)?.complete(password)
+    ) -> std::result::Result<PendingPayload, RetryableError<Self>> {
+        let sender_pubkey = match PublicKey::from_slice(packet.sender_pubkey_bytes()) {
+            Ok(sender_pubkey) => sender_pubkey,
+            Err(error) => return Err(RetryableError::new(self, error.into())),
+        };
+        let session_key = self.private_key.session_key(&sender_pubkey);
+        let inner = match session_key.decrypt_outer(packet.encrypted_body()) {
+            Ok(inner) => inner,
+            Err(error) => return Err(RetryableError::new(self, error)),
+        };
+
+        Ok(PendingPayload { receiver: Some(self), session_key, inner: Zeroizing::new(inner) })
     }
 }
 
@@ -71,48 +146,77 @@ pub struct ReceiveRequest {
 }
 
 /// A sender payload awaiting password-based decryption
-#[derive(Debug)]
 pub struct PendingPayload {
+    receiver: Option<ReceiverSession>,
     session_key: SessionKey,
-    inner: Vec<u8>,
+    inner: Zeroizing<Vec<u8>>,
 }
 
 impl PendingPayload {
-    /// Decrypts and decodes the payload with the transfer password
-    pub fn complete(mut self, password: &TeleportPassword) -> Result<DecodedPayload> {
+    /// Decrypts the exact plaintext without consuming this password-attempt state
+    pub fn decrypt(&self, password: &TeleportPassword) -> Result<DecryptedPayload> {
         let noid_key = password.expose_bytes();
         let paranoid_key = self.session_key.paranoid_key(noid_key);
-        let plaintext = Zeroizing::new(crypto::decrypt_inner(&paranoid_key, &self.inner)?);
-        let decoded = DecodedPayload::decode(&plaintext);
+        let plaintext = crypto::decrypt_inner(&paranoid_key, &self.inner)?;
 
-        self.inner.zeroize();
+        DecryptedPayload::from_bytes(plaintext)
+    }
 
-        decoded
+    /// Decrypts and decodes the payload
+    ///
+    /// A failure returns this pending state so the caller can retry the password
+    pub fn complete(
+        mut self,
+        password: &TeleportPassword,
+    ) -> std::result::Result<DecodedTransfer, RetryableError<Self>> {
+        let payload = match self.decrypt(password).and_then(DecryptedPayload::decode) {
+            Ok(payload) => payload,
+            Err(error) => return Err(RetryableError::new(self, error)),
+        };
+        let receiver =
+            self.receiver.take().expect("pending payload always owns its receiver session");
+
+        Ok(DecodedTransfer { receiver, payload })
+    }
+
+    /// Cancels the pending transfer and returns the active receiver session
+    pub fn into_receiver(mut self) -> ReceiverSession {
+        self.receiver.take().expect("pending payload always owns its receiver session")
     }
 }
 
-impl Drop for PendingPayload {
-    fn drop(&mut self) {
-        self.inner.zeroize();
+impl fmt::Debug for PendingPayload {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PendingPayload")
+            .field("receiver", &self.receiver)
+            .field("session_key", &self.session_key)
+            .field("inner", &format_args!("{} encrypted bytes", self.inner.len()))
+            .finish()
     }
 }
 
-pub(crate) fn encode_for_sender(
-    sender_private_key: EphemeralPrivateKey,
-    receiver_public_key: &PublicKey,
-    password: &TeleportPassword,
+/// A decoded transfer awaiting application acceptance
+#[derive(Debug)]
+pub struct DecodedTransfer {
+    receiver: ReceiverSession,
     payload: Payload,
-) -> Result<SenderPacket> {
-    let sender_public_key = sender_private_key.public_key();
-    let session_key = sender_private_key.session_key(receiver_public_key);
-    let noid_key = password.expose_bytes();
-    let paranoid_key = session_key.paranoid_key(noid_key);
-    let plaintext = payload.encode()?;
-    let inner = crypto::encrypt_inner(&paranoid_key, &plaintext);
-    let outer = session_key.encrypt_outer(&inner);
-    let mut packet = Vec::with_capacity(33 + outer.len());
-    packet.extend_from_slice(&sender_public_key.serialize());
-    packet.extend_from_slice(&outer);
+}
 
-    SenderPacket::new(packet).map_err(|_| Error::InvalidSenderPacket)
+impl DecodedTransfer {
+    /// Returns the decoded payload for review
+    pub fn payload(&self) -> &Payload {
+        &self.payload
+    }
+
+    /// Accepts the transfer, consumes the receiver session, and returns the payload
+    ///
+    /// The caller must also delete every persisted copy of the exported receiver secret
+    pub fn accept(self) -> Payload {
+        self.payload
+    }
+
+    /// Rejects the transfer and restores the active receiver session
+    pub fn reject(self) -> ReceiverSession {
+        self.receiver
+    }
 }

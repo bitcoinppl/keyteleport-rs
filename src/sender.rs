@@ -1,9 +1,8 @@
 use bitcoin::secp256k1::PublicKey;
 
 use crate::{
-    NumericCode, Payload, ReceiverPacket, Result, SenderPacket, TeleportPassword,
+    Error, NumericCode, Payload, ReceiverPacket, Result, SenderPacket, TeleportPassword,
     crypto::{self, EphemeralPrivateKey},
-    receiver,
 };
 
 /// A sender-side KeyTeleport session
@@ -27,11 +26,30 @@ impl SenderSession {
     /// Encrypts a payload and returns the sender response
     pub fn send(self, payload: Payload) -> Result<SendResponse> {
         let Self { receiver_public_key, private_key, password } = self;
-        let packet =
-            receiver::encode_for_sender(private_key, &receiver_public_key, &password, payload)?;
+        let packet = encode_for_sender(private_key, &receiver_public_key, &password, payload)?;
 
         Ok(SendResponse { packet, password })
     }
+}
+
+fn encode_for_sender(
+    sender_private_key: EphemeralPrivateKey,
+    receiver_public_key: &PublicKey,
+    password: &TeleportPassword,
+    payload: Payload,
+) -> Result<SenderPacket> {
+    let sender_public_key = sender_private_key.public_key();
+    let session_key = sender_private_key.session_key(receiver_public_key);
+    let noid_key = password.expose_bytes();
+    let paranoid_key = session_key.paranoid_key(noid_key);
+    let plaintext = payload.encode()?.into_bytes();
+    let inner = crypto::encrypt_inner(&paranoid_key, &plaintext);
+    let outer = session_key.encrypt_outer(&inner);
+    let mut packet = Vec::with_capacity(33 + outer.len());
+    packet.extend_from_slice(&sender_public_key.serialize());
+    packet.extend_from_slice(&outer);
+
+    SenderPacket::new(packet).map_err(|_| Error::InvalidSenderPacket)
 }
 
 #[cfg(test)]
@@ -39,7 +57,7 @@ mod tests {
     use bip39::Mnemonic;
 
     use super::*;
-    use crate::ReceiverSession;
+    use crate::{ReceiverSession, ReceiverSessionSecret};
 
     const RECEIVER_SECRET: [u8; 32] = [1; 32];
     const SENDER_SECRET: [u8; 32] = [3; 32];
@@ -49,7 +67,10 @@ mod tests {
 
     #[test]
     fn coldcard_sender_protocol_vector_matches() {
-        let receiver = ReceiverSession::from_private_key_bytes(RECEIVER_SECRET).unwrap();
+        let receiver = ReceiverSession::from_secret(
+            ReceiverSessionSecret::from_bytes(RECEIVER_SECRET).unwrap(),
+        )
+        .unwrap();
         let request = receiver.request().unwrap();
         let sender = sender_with_private_key_and_password(
             &request.packet,

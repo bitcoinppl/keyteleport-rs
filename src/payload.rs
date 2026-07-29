@@ -3,17 +3,16 @@ use std::{fmt, str::FromStr};
 use bip39::{Language, Mnemonic};
 use bitcoin::{
     NetworkKind,
-    bip32::{ChildNumber, Fingerprint, Xpriv},
+    bip32::{ChainCode, ChildNumber, Fingerprint, Xpriv},
+    psbt::Psbt,
     secp256k1::SecretKey,
 };
-use serde::{Deserialize, Deserializer};
+use data_encoding::HEXLOWER;
+use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::{Error, Result};
 
-const MAINNET_XPRV_VERSION: [u8; 4] = [0x04, 0x88, 0xad, 0xe4];
-
-// keyteleport payload type codes use the first decrypted body byte
 const PAYLOAD_CODE_STASH: u8 = b's';
 const PAYLOAD_CODE_XPRV: u8 = b'x';
 const PAYLOAD_CODE_NOTES: u8 = b'n';
@@ -21,129 +20,404 @@ const PAYLOAD_CODE_VAULT: u8 = b'v';
 const PAYLOAD_CODE_PSBT: u8 = b'p';
 const PAYLOAD_CODE_BACKUP: u8 = b'b';
 
-// COLDCARD 72-byte stash layout uses the first body byte as a marker
-//
-// - 0x01: master xprv as chain_code || private_key
-// - 0x10..=0x40: raw BIP32 master secret; marker is the secret length in bytes
-// - high bit set: BIP39 entropy; low bits encode length as ((marker & 0x03) + 2) * 8
 const STASH_LEN: usize = 72;
 const STASH_MARKER_XPRV: u8 = 0x01;
 const STASH_MARKER_MNEMONIC_FLAG: u8 = 0x80;
 const STASH_MNEMONIC_ENTROPY_UNITS_MASK: u8 = 0x03;
 const STASH_RAW_MASTER_SECRET_LEN: std::ops::RangeInclusive<u8> = 0x10..=0x40;
 
-/// A recognized KeyTeleport payload type that this crate cannot decode
+/// A Key Teleport payload type code
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum UnsupportedPayloadKind {
-    /// A COLDCARD vault payload
+pub enum PayloadKind {
+    /// A COLDCARD stash payload
+    Stash,
+    /// A full binary XPRV payload
+    Xprv,
+    /// A Secure Notes & Passwords JSON payload
+    Notes,
+    /// A Seed Vault JSON payload
     Vault,
-    /// A PSBT payload
+    /// A binary PSBT payload
     Psbt,
-    /// A COLDCARD backup payload
+    /// A full COLDCARD backup payload
     Backup,
-    /// An unknown payload code
+    /// An unrecognized payload code
     Unknown(u8),
 }
 
-impl fmt::Display for UnsupportedPayloadKind {
+impl PayloadKind {
+    /// Returns the wire type code
+    pub fn code(self) -> u8 {
+        match self {
+            Self::Stash => PAYLOAD_CODE_STASH,
+            Self::Xprv => PAYLOAD_CODE_XPRV,
+            Self::Notes => PAYLOAD_CODE_NOTES,
+            Self::Vault => PAYLOAD_CODE_VAULT,
+            Self::Psbt => PAYLOAD_CODE_PSBT,
+            Self::Backup => PAYLOAD_CODE_BACKUP,
+            Self::Unknown(code) => code,
+        }
+    }
+
+    fn from_code(code: u8) -> Self {
+        match code {
+            PAYLOAD_CODE_STASH => Self::Stash,
+            PAYLOAD_CODE_XPRV => Self::Xprv,
+            PAYLOAD_CODE_NOTES => Self::Notes,
+            PAYLOAD_CODE_VAULT => Self::Vault,
+            PAYLOAD_CODE_PSBT => Self::Psbt,
+            PAYLOAD_CODE_BACKUP => Self::Backup,
+            other => Self::Unknown(other),
+        }
+    }
+
+    fn is_known_code(code: u8) -> bool {
+        !matches!(Self::from_code(code), Self::Unknown(_))
+    }
+}
+
+impl fmt::Display for PayloadKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Vault => write!(f, "{}", PAYLOAD_CODE_VAULT as char),
-            Self::Psbt => write!(f, "{}", PAYLOAD_CODE_PSBT as char),
-            Self::Backup => write!(f, "{}", PAYLOAD_CODE_BACKUP as char),
             Self::Unknown(code) => write!(f, "0x{code:02x}"),
+            known => write!(f, "{}", known.code() as char),
         }
     }
 }
 
+/// A decrypted payload that retains the exact plaintext wire bytes
 #[derive(Clone, PartialEq, Eq)]
-enum PayloadKind {
-    Mnemonic(Mnemonic),
-    Xprv(XprvPayload),
+pub struct DecryptedPayload(Zeroizing<Vec<u8>>);
+
+impl DecryptedPayload {
+    /// Validates and retains decrypted payload bytes
+    pub fn from_bytes(bytes: Vec<u8>) -> Result<Self> {
+        if bytes.is_empty() {
+            return Err(Error::InvalidPayload);
+        }
+
+        Ok(Self(Zeroizing::new(bytes)))
+    }
+
+    /// Returns the payload type
+    pub fn kind(&self) -> PayloadKind {
+        PayloadKind::from_code(self.0[0])
+    }
+
+    /// Exposes the complete plaintext wire payload
+    pub fn expose_bytes(&self) -> &[u8] {
+        &self.0
+    }
+
+    /// Exposes the plaintext body without the type code
+    pub fn expose_body(&self) -> &[u8] {
+        &self.0[1..]
+    }
+
+    /// Decodes the plaintext into a typed payload
+    pub fn decode(self) -> Result<Payload> {
+        let Self(mut bytes) = self;
+        let code = bytes.remove(0);
+
+        match PayloadKind::from_code(code) {
+            PayloadKind::Stash => decode_stash_body(&bytes).map(Payload::from),
+            PayloadKind::Xprv => {
+                decode_full_xprv_body(&bytes).map(|value| Payload::Xprv(value.with_full_format()))
+            }
+            PayloadKind::Notes => decode_notes_body(&bytes).map(Payload::Notes),
+            PayloadKind::Vault => decode_vault_body(&bytes).map(Payload::Vault),
+            PayloadKind::Psbt => PsbtPayload::new(std::mem::take(&mut *bytes)).map(Payload::Psbt),
+            PayloadKind::Backup => {
+                BackupPayload::new(std::mem::take(&mut *bytes)).map(Payload::Backup)
+            }
+            PayloadKind::Unknown(code) => Ok(Payload::Unknown(UnknownPayload {
+                code,
+                body: Zeroizing::new(std::mem::take(&mut *bytes)),
+            })),
+        }
+    }
+
+    pub(crate) fn into_bytes(mut self) -> Zeroizing<Vec<u8>> {
+        Zeroizing::new(std::mem::take(&mut *self.0))
+    }
 }
 
-/// A secret payload that can be transferred by COLDCARD KeyTeleport
+impl fmt::Debug for DecryptedPayload {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DecryptedPayload")
+            .field("kind", &self.kind())
+            .field("body_len", &self.expose_body().len())
+            .finish_non_exhaustive()
+    }
+}
+
+/// A typed Key Teleport payload
 #[derive(Clone, PartialEq, Eq)]
-pub struct Payload(PayloadKind);
+pub enum Payload {
+    /// A BIP39 mnemonic stash
+    Mnemonic(Mnemonic),
+    /// A BIP32 master extended private key
+    Xprv(XprvPayload),
+    /// A raw BIP32 master secret
+    MasterSecret(MasterSecret),
+    /// COLDCARD Secure Notes & Passwords records
+    Notes(NotesPayload),
+    /// A COLDCARD Seed Vault entry
+    Vault(VaultPayload),
+    /// A binary PSBT
+    Psbt(PsbtPayload),
+    /// A full COLDCARD backup
+    Backup(BackupPayload),
+    /// An unrecognized future payload
+    Unknown(UnknownPayload),
+}
 
 impl Payload {
     /// Creates a mnemonic payload when its word count is supported by COLDCARD
     pub fn mnemonic(mnemonic: Mnemonic) -> Result<Self> {
-        if mnemonic.language() != Language::English {
-            return Err(Error::UnsupportedMnemonicLanguage);
-        }
+        validate_mnemonic(&mnemonic)?;
 
-        let word_count = mnemonic.word_count();
-        if !matches!(word_count, 12 | 18 | 24) {
-            return Err(Error::UnsupportedMnemonicWordCount(word_count));
-        }
-
-        Ok(Self(PayloadKind::Mnemonic(mnemonic)))
+        Ok(Self::Mnemonic(mnemonic))
     }
 
-    /// Creates an xprv payload
+    /// Creates a canonical stash-encoded master XPRV payload
     pub fn xprv(value: impl AsRef<str>) -> Result<Self> {
-        Ok(Self(PayloadKind::Xprv(XprvPayload::parse(value.as_ref())?)))
+        XprvPayload::parse(value.as_ref()).map(Self::Xprv)
     }
 
-    pub(crate) fn encode(&self) -> Result<Zeroizing<Vec<u8>>> {
-        match &self.0 {
-            PayloadKind::Mnemonic(mnemonic) => encode_mnemonic_payload(mnemonic),
-            PayloadKind::Xprv(xprv) => encode_xprv_payload(xprv),
+    /// Creates a full binary XPRV payload
+    pub fn full_xprv(value: impl AsRef<str>) -> Result<Self> {
+        XprvPayload::parse(value.as_ref()).map(|value| Self::Xprv(value.with_full_format()))
+    }
+
+    /// Creates a raw BIP32 master-secret stash payload
+    pub fn master_secret(bytes: Vec<u8>) -> Result<Self> {
+        MasterSecret::new(bytes).map(Self::MasterSecret)
+    }
+
+    /// Creates a Secure Notes & Passwords payload
+    pub fn notes(records: Vec<NotesRecord>) -> Result<Self> {
+        NotesPayload::new(records).map(Self::Notes)
+    }
+
+    /// Creates a Seed Vault payload
+    pub fn vault(value: VaultPayload) -> Self {
+        Self::Vault(value)
+    }
+
+    /// Creates a validated PSBT payload
+    pub fn psbt(bytes: Vec<u8>) -> Result<Self> {
+        PsbtPayload::new(bytes).map(Self::Psbt)
+    }
+
+    /// Creates a full-backup payload
+    pub fn backup(bytes: Vec<u8>) -> Result<Self> {
+        BackupPayload::new(bytes).map(Self::Backup)
+    }
+
+    /// Creates an unrecognized future payload
+    pub fn unknown(code: u8, body: Vec<u8>) -> Result<Self> {
+        UnknownPayload::new(code, body).map(Self::Unknown)
+    }
+
+    /// Returns the semantic payload type
+    pub fn kind(&self) -> PayloadKind {
+        match self {
+            Self::Mnemonic(_) | Self::MasterSecret(_) => PayloadKind::Stash,
+            Self::Xprv(value) => match value.wire_format() {
+                XprvWireFormat::Stash => PayloadKind::Stash,
+                XprvWireFormat::Full => PayloadKind::Xprv,
+            },
+            Self::Notes(_) => PayloadKind::Notes,
+            Self::Vault(_) => PayloadKind::Vault,
+            Self::Psbt(_) => PayloadKind::Psbt,
+            Self::Backup(_) => PayloadKind::Backup,
+            Self::Unknown(value) => PayloadKind::Unknown(value.code()),
+        }
+    }
+
+    /// Encodes the typed value as exact decrypted wire bytes
+    pub fn encode(&self) -> Result<DecryptedPayload> {
+        let mut encoded = match self {
+            Self::Mnemonic(mnemonic) => {
+                encode_stash_payload(&VaultSecret::Mnemonic(mnemonic.clone()))?
+            }
+            Self::Xprv(xprv) if xprv.wire_format() == XprvWireFormat::Full => {
+                encode_full_xprv_payload(xprv)?
+            }
+            Self::Xprv(xprv) => encode_stash_payload(&VaultSecret::Xprv(xprv.clone()))?,
+            Self::MasterSecret(secret) => {
+                encode_stash_payload(&VaultSecret::MasterSecret(secret.clone()))?
+            }
+            Self::Notes(notes) => encode_notes_payload(notes)?,
+            Self::Vault(vault) => encode_vault_payload(vault)?,
+            Self::Psbt(psbt) => encode_raw_payload(PAYLOAD_CODE_PSBT, psbt.expose_bytes()),
+            Self::Backup(backup) => encode_raw_payload(PAYLOAD_CODE_BACKUP, backup.expose_bytes()),
+            Self::Unknown(unknown) => encode_raw_payload(unknown.code, unknown.expose_body()),
+        };
+
+        DecryptedPayload::from_bytes(std::mem::take(&mut *encoded))
+    }
+}
+
+impl From<VaultSecret> for Payload {
+    fn from(value: VaultSecret) -> Self {
+        match value {
+            VaultSecret::Mnemonic(value) => Self::Mnemonic(value),
+            VaultSecret::Xprv(value) => Self::Xprv(value),
+            VaultSecret::MasterSecret(value) => Self::MasterSecret(value),
         }
     }
 }
 
 impl fmt::Debug for Payload {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self.0 {
-            PayloadKind::Mnemonic(_) => f.write_str("Payload::Mnemonic(****)"),
-            PayloadKind::Xprv(_) => f.write_str("Payload::Xprv(****)"),
+        match self {
+            Self::Mnemonic(_) => f.write_str("Payload::Mnemonic(****)"),
+            Self::Xprv(_) => f.write_str("Payload::Xprv(****)"),
+            Self::MasterSecret(_) => f.write_str("Payload::MasterSecret(****)"),
+            Self::Notes(value) => f
+                .debug_struct("Payload::Notes")
+                .field("record_count", &value.records().len())
+                .finish_non_exhaustive(),
+            Self::Vault(_) => f.write_str("Payload::Vault(****)"),
+            Self::Psbt(value) => f
+                .debug_struct("Payload::Psbt")
+                .field("byte_len", &value.expose_bytes().len())
+                .finish_non_exhaustive(),
+            Self::Backup(value) => f
+                .debug_struct("Payload::Backup")
+                .field("byte_len", &value.expose_bytes().len())
+                .finish_non_exhaustive(),
+            Self::Unknown(value) => f
+                .debug_struct("Payload::Unknown")
+                .field("code", &format_args!("0x{:02x}", value.code()))
+                .field("body_len", &value.expose_body().len())
+                .finish_non_exhaustive(),
         }
     }
 }
 
-/// A validated master extended private key transferred by KeyTeleport
+/// The wire representation used for a master XPRV
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum XprvWireFormat {
+    /// The compact COLDCARD stash representation
+    Stash,
+    /// The full 78-byte binary BIP32 representation
+    Full,
+}
+
+/// A validated master extended private key transferred by Key Teleport
 #[derive(Clone, PartialEq, Eq)]
 pub struct XprvPayload {
-    value: String,
+    chain_code: ChainCode,
+    private_key: SecretKey,
+    network: Option<NetworkKind>,
+    wire_format: XprvWireFormat,
 }
 
 impl XprvPayload {
     /// Parses and validates a master extended private key
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the value is invalid, is not a mainnet key, or represents a derived
-    /// child key
     pub fn parse(value: &str) -> Result<Self> {
         let xprv = Xpriv::from_str(value).map_err(|_| Error::InvalidXprvPayload)?;
-        if xprv.network != NetworkKind::Main {
-            return Err(Error::NonMainnetXprvPayload);
-        }
+        validate_master_xprv(&xprv)?;
 
-        if !is_master_xprv(&xprv) {
-            return Err(Error::NonMasterXprvPayload);
-        }
-
-        Ok(Self { value: xprv.to_string() })
+        Ok(Self::from_xpriv(xprv))
     }
 
-    /// Exposes the encoded extended private key
-    pub fn expose_string(&self) -> &str {
-        &self.value
+    /// Returns the network encoded by a full XPRV when one is available
+    ///
+    /// A compact stash does not carry a network
+    pub fn network(&self) -> Option<NetworkKind> {
+        self.network
+    }
+
+    /// Builds a master extended private key for the selected network
+    pub fn to_xpriv(&self, network: NetworkKind) -> Xpriv {
+        Xpriv {
+            network,
+            depth: 0,
+            parent_fingerprint: Fingerprint::default(),
+            child_number: ChildNumber::Normal { index: 0 },
+            private_key: self.private_key,
+            chain_code: self.chain_code,
+        }
+    }
+
+    /// Returns a Base58Check master extended private key for the selected network
+    pub fn encode_string(&self, network: NetworkKind) -> String {
+        self.to_xpriv(network).to_string()
+    }
+
+    /// Returns the selected wire representation
+    pub fn wire_format(&self) -> XprvWireFormat {
+        self.wire_format
+    }
+
+    fn with_full_format(mut self) -> Self {
+        self.wire_format = XprvWireFormat::Full;
+        self
+    }
+
+    fn from_xpriv(xprv: Xpriv) -> Self {
+        Self {
+            chain_code: xprv.chain_code,
+            private_key: xprv.private_key,
+            network: Some(xprv.network),
+            wire_format: XprvWireFormat::Stash,
+        }
+    }
+
+    fn from_stash(chain_code: ChainCode, private_key: SecretKey) -> Self {
+        Self { chain_code, private_key, network: None, wire_format: XprvWireFormat::Stash }
     }
 }
 
 impl fmt::Debug for XprvPayload {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("XprvPayload(****)")
+        f.debug_struct("XprvPayload")
+            .field("network", &self.network)
+            .field("wire_format", &self.wire_format)
+            .finish_non_exhaustive()
     }
 }
 
 impl Drop for XprvPayload {
     fn drop(&mut self) {
-        self.value.zeroize();
+        self.private_key.non_secure_erase();
+    }
+}
+
+/// A raw BIP32 master secret between 16 and 64 bytes
+#[derive(Clone, PartialEq, Eq)]
+pub struct MasterSecret(Zeroizing<Vec<u8>>);
+
+impl MasterSecret {
+    /// Validates and retains raw master-secret bytes
+    pub fn new(bytes: Vec<u8>) -> Result<Self> {
+        if !matches!(bytes.len(), 16..=64) {
+            return Err(Error::InvalidMasterSecretLength(bytes.len()));
+        }
+
+        Ok(Self(Zeroizing::new(bytes)))
+    }
+
+    /// Exposes the raw master-secret bytes
+    pub fn expose_bytes(&self) -> &[u8] {
+        &self.0
+    }
+
+    /// Derives the corresponding master XPRV
+    pub fn derive_xprv(&self, network: NetworkKind) -> Result<XprvPayload> {
+        let xprv = Xpriv::new_master(network, &self.0).map_err(|_| Error::InvalidXprvPayload)?;
+
+        XprvPayload::parse(&xprv.to_string())
+    }
+}
+
+impl fmt::Debug for MasterSecret {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("MasterSecret").field(&format_args!("{} bytes", self.0.len())).finish()
     }
 }
 
@@ -153,9 +427,23 @@ impl Drop for XprvPayload {
 pub struct NotesPayload(Vec<NotesRecord>);
 
 impl NotesPayload {
-    /// Returns the decoded records in their transmitted order
+    /// Validates a nonempty collection of notes and passwords
+    pub fn new(records: Vec<NotesRecord>) -> Result<Self> {
+        if records.is_empty() {
+            return Err(Error::InvalidNotesPayload);
+        }
+
+        Ok(Self(records))
+    }
+
+    /// Returns records in transmitted order
     pub fn records(&self) -> &[NotesRecord] {
         &self.0
+    }
+
+    /// Consumes the payload and returns its records
+    pub fn into_records(mut self) -> Vec<NotesRecord> {
+        std::mem::take(&mut self.0)
     }
 }
 
@@ -176,7 +464,7 @@ pub enum NotesRecord {
 }
 
 impl NotesRecord {
-    /// Returns the title shown for this record
+    /// Returns the record title
     pub fn title(&self) -> &str {
         match self {
             Self::Note(note) => note.title(),
@@ -184,7 +472,7 @@ impl NotesRecord {
         }
     }
 
-    /// Returns the optional group shown for this record
+    /// Returns the optional record group
     pub fn group(&self) -> &str {
         match self {
             Self::Note(note) => note.group(),
@@ -202,7 +490,7 @@ impl fmt::Debug for NotesRecord {
     }
 }
 
-/// A decoded COLDCARD free-form secure note
+/// A COLDCARD free-form secure note
 #[derive(Clone, PartialEq, Eq, Zeroize)]
 #[zeroize(drop)]
 pub struct NoteRecord {
@@ -212,6 +500,15 @@ pub struct NoteRecord {
 }
 
 impl NoteRecord {
+    /// Creates a secure note
+    pub fn new(title: String, text: String, group: String) -> Result<Self> {
+        if title.is_empty() {
+            return Err(Error::InvalidNotesPayload);
+        }
+
+        Ok(Self { title, text, group })
+    }
+
     /// Returns the note title
     pub fn title(&self) -> &str {
         &self.title
@@ -222,7 +519,7 @@ impl NoteRecord {
         &self.text
     }
 
-    /// Returns the optional group, or an empty string when absent
+    /// Returns the optional group
     pub fn group(&self) -> &str {
         &self.group
     }
@@ -234,7 +531,7 @@ impl fmt::Debug for NoteRecord {
     }
 }
 
-/// A decoded COLDCARD structured password record
+/// A COLDCARD structured password record
 #[derive(Clone, PartialEq, Eq, Zeroize)]
 #[zeroize(drop)]
 pub struct PasswordRecord {
@@ -247,32 +544,48 @@ pub struct PasswordRecord {
 }
 
 impl PasswordRecord {
+    /// Creates a structured password record
+    pub fn new(
+        title: String,
+        username: String,
+        password: String,
+        site: String,
+        notes: String,
+        group: String,
+    ) -> Result<Self> {
+        if title.is_empty() {
+            return Err(Error::InvalidNotesPayload);
+        }
+
+        Ok(Self { title, username, password, site, notes, group })
+    }
+
     /// Returns the password record title
     pub fn title(&self) -> &str {
         &self.title
     }
 
-    /// Returns the username, or an empty string when absent
+    /// Returns the username
     pub fn username(&self) -> &str {
         &self.username
     }
 
-    /// Returns the password, or an empty string when absent
+    /// Returns the password
     pub fn password(&self) -> &str {
         &self.password
     }
 
-    /// Returns the site, or an empty string when absent
+    /// Returns the site
     pub fn site(&self) -> &str {
         &self.site
     }
 
-    /// Returns the free-form notes, or an empty string when absent
+    /// Returns the free-form notes
     pub fn notes(&self) -> &str {
         &self.notes
     }
 
-    /// Returns the optional group, or an empty string when absent
+    /// Returns the optional group
     pub fn group(&self) -> &str {
         &self.group
     }
@@ -284,19 +597,196 @@ impl fmt::Debug for PasswordRecord {
     }
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
+/// A secret stored in a COLDCARD Seed Vault entry
+#[derive(Clone, PartialEq, Eq)]
+pub enum VaultSecret {
+    /// A BIP39 mnemonic
+    Mnemonic(Mnemonic),
+    /// A BIP32 master XPRV
+    Xprv(XprvPayload),
+    /// A raw BIP32 master secret
+    MasterSecret(MasterSecret),
+}
+
+impl fmt::Debug for VaultSecret {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Mnemonic(_) => f.write_str("VaultSecret::Mnemonic(****)"),
+            Self::Xprv(_) => f.write_str("VaultSecret::Xprv(****)"),
+            Self::MasterSecret(_) => f.write_str("VaultSecret::MasterSecret(****)"),
+        }
+    }
+}
+
+/// A typed COLDCARD Seed Vault entry
+#[derive(Clone, PartialEq, Eq)]
+pub struct VaultPayload {
+    fingerprint: String,
+    secret: VaultSecret,
+    label: String,
+    origin: String,
+}
+
+impl VaultPayload {
+    /// Creates a validated Seed Vault entry
+    pub fn new(
+        fingerprint: impl AsRef<str>,
+        secret: VaultSecret,
+        label: String,
+        origin: String,
+    ) -> Result<Self> {
+        if let VaultSecret::Mnemonic(mnemonic) = &secret {
+            validate_mnemonic(mnemonic)?;
+        }
+        let fingerprint = normalize_fingerprint(fingerprint.as_ref())?;
+
+        Ok(Self { fingerprint, secret, label, origin })
+    }
+
+    /// Returns the eight-digit hexadecimal master fingerprint
+    pub fn fingerprint(&self) -> &str {
+        &self.fingerprint
+    }
+
+    /// Returns the stored secret
+    pub fn secret(&self) -> &VaultSecret {
+        &self.secret
+    }
+
+    /// Returns the entry label
+    pub fn label(&self) -> &str {
+        &self.label
+    }
+
+    /// Returns the entry origin
+    pub fn origin(&self) -> &str {
+        &self.origin
+    }
+}
+
+impl fmt::Debug for VaultPayload {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("VaultPayload(****)")
+    }
+}
+
+impl Drop for VaultPayload {
+    fn drop(&mut self) {
+        self.fingerprint.zeroize();
+        self.label.zeroize();
+        self.origin.zeroize();
+    }
+}
+
+/// A validated binary PSBT payload
+#[derive(Clone, PartialEq, Eq)]
+pub struct PsbtPayload(Zeroizing<Vec<u8>>);
+
+impl PsbtPayload {
+    /// Parses and retains a binary PSBT
+    pub fn new(bytes: Vec<u8>) -> Result<Self> {
+        Psbt::deserialize(&bytes).map_err(|_| Error::InvalidPsbtPayload)?;
+
+        Ok(Self(Zeroizing::new(bytes)))
+    }
+
+    /// Exposes the binary PSBT bytes
+    pub fn expose_bytes(&self) -> &[u8] {
+        &self.0
+    }
+
+    /// Parses the retained bytes as a Bitcoin PSBT
+    pub fn parse(&self) -> Result<Psbt> {
+        Psbt::deserialize(&self.0).map_err(|_| Error::InvalidPsbtPayload)
+    }
+}
+
+impl fmt::Debug for PsbtPayload {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("PsbtPayload").field(&format_args!("{} bytes", self.0.len())).finish()
+    }
+}
+
+/// A full COLDCARD backup payload retained as secret bytes
+#[derive(Clone, PartialEq, Eq)]
+pub struct BackupPayload(Zeroizing<Vec<u8>>);
+
+impl BackupPayload {
+    /// Validates and retains a nonempty backup
+    pub fn new(bytes: Vec<u8>) -> Result<Self> {
+        if bytes.is_empty() {
+            return Err(Error::InvalidBackupPayload);
+        }
+
+        Ok(Self(Zeroizing::new(bytes)))
+    }
+
+    /// Exposes the backup bytes
+    pub fn expose_bytes(&self) -> &[u8] {
+        &self.0
+    }
+
+    /// Returns the backup as UTF-8 text when possible
+    pub fn as_text(&self) -> Result<&str> {
+        std::str::from_utf8(&self.0).map_err(|_| Error::InvalidBackupPayload)
+    }
+}
+
+impl fmt::Debug for BackupPayload {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("BackupPayload").field(&format_args!("{} bytes", self.0.len())).finish()
+    }
+}
+
+/// An unrecognized future payload retained without data loss
+#[derive(Clone, PartialEq, Eq)]
+pub struct UnknownPayload {
+    code: u8,
+    body: Zeroizing<Vec<u8>>,
+}
+
+impl UnknownPayload {
+    /// Creates a payload for an unrecognized type code
+    pub fn new(code: u8, body: Vec<u8>) -> Result<Self> {
+        if PayloadKind::is_known_code(code) {
+            return Err(Error::KnownPayloadCode(code));
+        }
+
+        Ok(Self { code, body: Zeroizing::new(body) })
+    }
+
+    /// Returns the unrecognized type code
+    pub fn code(&self) -> u8 {
+        self.code
+    }
+
+    /// Exposes the unknown plaintext body
+    pub fn expose_body(&self) -> &[u8] {
+        &self.body
+    }
+}
+
+impl fmt::Debug for UnknownPayload {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("UnknownPayload")
+            .field("code", &format_args!("0x{:02x}", self.code))
+            .field("body_len", &self.body.len())
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Deserialize, Serialize)]
 struct WireNotesRecord {
     title: String,
-    #[serde(default, deserialize_with = "deserialize_optional_string")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     user: Option<String>,
-    #[serde(default, deserialize_with = "deserialize_optional_string")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     password: Option<String>,
-    #[serde(default, deserialize_with = "deserialize_optional_string")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     site: Option<String>,
-    #[serde(default, deserialize_with = "deserialize_optional_string")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     misc: Option<String>,
-    #[serde(default, deserialize_with = "deserialize_optional_string")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     group: Option<String>,
 }
 
@@ -311,63 +801,219 @@ impl Drop for WireNotesRecord {
     }
 }
 
-/// A payload decoded from a sender response
-#[derive(Clone, PartialEq, Eq)]
-pub enum DecodedPayload {
-    /// A BIP39 mnemonic
-    Mnemonic(Mnemonic),
-    /// A BIP32 master extended private key
-    Xprv(XprvPayload),
-    /// COLDCARD Secure Notes & Passwords records
-    Notes(NotesPayload),
-}
+#[derive(Deserialize)]
+struct WireVaultPayload(String, String, String, String);
 
-impl DecodedPayload {
-    pub(crate) fn decode(bytes: &[u8]) -> Result<Self> {
-        let (&code, body) = bytes.split_first().ok_or(Error::InvalidPacket)?;
-
-        match code {
-            PAYLOAD_CODE_STASH => decode_stash_payload(body),
-            PAYLOAD_CODE_XPRV => decode_xprv_body(body),
-            PAYLOAD_CODE_NOTES => decode_notes_body(body),
-            PAYLOAD_CODE_VAULT => Err(Error::UnsupportedPayload(UnsupportedPayloadKind::Vault)),
-            PAYLOAD_CODE_PSBT => Err(Error::UnsupportedPayload(UnsupportedPayloadKind::Psbt)),
-            PAYLOAD_CODE_BACKUP => Err(Error::UnsupportedPayload(UnsupportedPayloadKind::Backup)),
-            other => Err(Error::UnsupportedPayload(UnsupportedPayloadKind::Unknown(other))),
-        }
+impl Drop for WireVaultPayload {
+    fn drop(&mut self) {
+        self.0.zeroize();
+        self.1.zeroize();
+        self.2.zeroize();
+        self.3.zeroize();
     }
 }
 
-impl fmt::Debug for DecodedPayload {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Mnemonic(_) => f.write_str("DecodedPayload::Mnemonic(****)"),
-            Self::Xprv(_) => f.write_str("DecodedPayload::Xprv(****)"),
-            Self::Notes(_) => f.write_str("DecodedPayload::Notes(****)"),
-        }
-    }
-}
-
-fn encode_mnemonic_payload(mnemonic: &Mnemonic) -> Result<Zeroizing<Vec<u8>>> {
-    let entropy = Zeroizing::new(mnemonic_entropy(mnemonic)?);
-    if !matches!(entropy.len(), 16 | 24 | 32) {
-        return Err(Error::UnsupportedMnemonicWordCount(mnemonic.word_count()));
-    }
-
-    let marker = STASH_MARKER_MNEMONIC_FLAG | ((entropy.len() / 8) - 2) as u8;
-    let mut encoded = Zeroizing::new(Vec::with_capacity(1 + 1 + entropy.len()));
+fn encode_stash_payload(secret: &VaultSecret) -> Result<Zeroizing<Vec<u8>>> {
+    let body = encode_stash_body(secret)?;
+    let mut encoded = Zeroizing::new(Vec::with_capacity(1 + body.len()));
     encoded.push(PAYLOAD_CODE_STASH);
-    encoded.push(marker);
-    encoded.extend_from_slice(&entropy);
-    trim_stash_padding(&mut encoded);
+    encoded.extend_from_slice(&body);
 
     Ok(encoded)
 }
 
-fn mnemonic_entropy(mnemonic: &Mnemonic) -> Result<Vec<u8>> {
-    if mnemonic.language() != Language::English {
-        return Err(Error::UnsupportedMnemonicLanguage);
+fn encode_stash_body(secret: &VaultSecret) -> Result<Zeroizing<Vec<u8>>> {
+    let mut encoded = Zeroizing::new(Vec::with_capacity(STASH_LEN));
+
+    match secret {
+        VaultSecret::Mnemonic(mnemonic) => {
+            let entropy = Zeroizing::new(mnemonic_entropy(mnemonic)?);
+            if !matches!(entropy.len(), 16 | 24 | 32) {
+                return Err(Error::UnsupportedMnemonicWordCount(mnemonic.word_count()));
+            }
+
+            let marker = STASH_MARKER_MNEMONIC_FLAG | ((entropy.len() / 8) - 2) as u8;
+            encoded.push(marker);
+            encoded.extend_from_slice(&entropy);
+        }
+        VaultSecret::Xprv(xprv) => {
+            let private_key = Zeroizing::new(xprv.private_key.secret_bytes());
+            encoded.push(STASH_MARKER_XPRV);
+            encoded.extend_from_slice(xprv.chain_code.as_bytes());
+            encoded.extend_from_slice(private_key.as_ref());
+        }
+        VaultSecret::MasterSecret(secret) => {
+            encoded.push(secret.expose_bytes().len() as u8);
+            encoded.extend_from_slice(secret.expose_bytes());
+        }
     }
+
+    trim_stash_padding(&mut encoded);
+    Ok(encoded)
+}
+
+fn encode_full_xprv_payload(xprv: &XprvPayload) -> Result<Zeroizing<Vec<u8>>> {
+    let network = xprv.network.ok_or(Error::MissingXprvNetwork)?;
+    let xprv = xprv.to_xpriv(network);
+    let encoded_xprv = Zeroizing::new(xprv.encode());
+    let mut encoded = Zeroizing::new(Vec::with_capacity(1 + encoded_xprv.len()));
+    encoded.push(PAYLOAD_CODE_XPRV);
+    encoded.extend_from_slice(encoded_xprv.as_ref());
+
+    Ok(encoded)
+}
+
+fn encode_notes_payload(notes: &NotesPayload) -> Result<Zeroizing<Vec<u8>>> {
+    let records = notes.records().iter().map(WireNotesRecord::from).collect::<Vec<_>>();
+    let json =
+        Zeroizing::new(serde_json::to_vec(&records).map_err(|_| Error::InvalidNotesPayload)?);
+    let mut encoded = Zeroizing::new(Vec::with_capacity(1 + json.len()));
+    encoded.push(PAYLOAD_CODE_NOTES);
+    encoded.extend_from_slice(&json);
+
+    Ok(encoded)
+}
+
+fn encode_vault_payload(vault: &VaultPayload) -> Result<Zeroizing<Vec<u8>>> {
+    let secret = encode_stash_body(&vault.secret)?;
+    let encoded_secret = Zeroizing::new(HEXLOWER.encode(&secret));
+    let wire = (
+        vault.fingerprint.as_str(),
+        encoded_secret.as_str(),
+        vault.label.as_str(),
+        vault.origin.as_str(),
+    );
+    let json = Zeroizing::new(serde_json::to_vec(&wire).map_err(|_| Error::InvalidVaultPayload)?);
+    let mut encoded = Zeroizing::new(Vec::with_capacity(1 + json.len()));
+    encoded.push(PAYLOAD_CODE_VAULT);
+    encoded.extend_from_slice(&json);
+
+    Ok(encoded)
+}
+
+fn encode_raw_payload(code: u8, body: &[u8]) -> Zeroizing<Vec<u8>> {
+    let mut encoded = Zeroizing::new(Vec::with_capacity(1 + body.len()));
+    encoded.push(code);
+    encoded.extend_from_slice(body);
+    encoded
+}
+
+fn decode_stash_body(body: &[u8]) -> Result<VaultSecret> {
+    if body.is_empty() || body.len() > STASH_LEN {
+        return Err(Error::InvalidStashPayload);
+    }
+
+    let mut stash = Zeroizing::new([0_u8; STASH_LEN]);
+    stash[..body.len()].copy_from_slice(body);
+    let marker = stash[0];
+    let rest = &stash[1..];
+
+    if marker == STASH_MARKER_XPRV {
+        return decode_stash_xprv(rest).map(VaultSecret::Xprv);
+    }
+
+    if STASH_RAW_MASTER_SECRET_LEN.contains(&marker) {
+        let secret = MasterSecret::new(rest[..usize::from(marker)].to_vec())?;
+        return Ok(VaultSecret::MasterSecret(secret));
+    }
+
+    if marker & STASH_MARKER_MNEMONIC_FLAG == 0 {
+        return Err(Error::InvalidStashPayload);
+    }
+
+    let entropy_len = usize::from((marker & STASH_MNEMONIC_ENTROPY_UNITS_MASK) + 2) * 8;
+    if !matches!(entropy_len, 16 | 24 | 32) || rest.len() < entropy_len {
+        return Err(Error::InvalidStashPayload);
+    }
+
+    let mnemonic = Mnemonic::from_entropy(&rest[..entropy_len])?;
+    Ok(VaultSecret::Mnemonic(mnemonic))
+}
+
+fn decode_stash_xprv(body: &[u8]) -> Result<XprvPayload> {
+    if body.len() != STASH_LEN - 1 {
+        return Err(Error::InvalidXprvPayload);
+    }
+
+    let chain_code =
+        ChainCode::from(<[u8; 32]>::try_from(&body[..32]).expect("chain code is 32 bytes"));
+    let private_key =
+        SecretKey::from_slice(&body[32..64]).map_err(|_| Error::InvalidXprvPayload)?;
+
+    Ok(XprvPayload::from_stash(chain_code, private_key))
+}
+
+fn decode_full_xprv_body(body: &[u8]) -> Result<XprvPayload> {
+    let xprv = Xpriv::decode(body).map_err(|_| Error::InvalidXprvPayload)?;
+    validate_master_xprv(&xprv)?;
+
+    Ok(XprvPayload::from_xpriv(xprv))
+}
+
+fn decode_notes_body(body: &[u8]) -> Result<NotesPayload> {
+    let mut records: Vec<WireNotesRecord> =
+        serde_json::from_slice(body).map_err(|_| Error::InvalidNotesPayload)?;
+    let records = records.iter_mut().map(NotesRecord::try_from).collect::<Result<Vec<_>>>()?;
+
+    NotesPayload::new(records)
+}
+
+fn decode_vault_body(body: &[u8]) -> Result<VaultPayload> {
+    let mut wire: WireVaultPayload =
+        serde_json::from_slice(body).map_err(|_| Error::InvalidVaultPayload)?;
+    let secret_bytes = decode_hex_secret(&wire.1)?;
+    let secret = decode_stash_body(&secret_bytes)?;
+
+    VaultPayload::new(
+        std::mem::take(&mut wire.0),
+        secret,
+        std::mem::take(&mut wire.2),
+        std::mem::take(&mut wire.3),
+    )
+}
+
+fn decode_hex_secret(value: &str) -> Result<Zeroizing<Vec<u8>>> {
+    let mut normalized = Zeroizing::new(value.to_string());
+    normalized.make_ascii_lowercase();
+    if !normalized.len().is_multiple_of(2) {
+        normalized.push('0');
+    }
+
+    HEXLOWER
+        .decode(normalized.as_bytes())
+        .map(Zeroizing::new)
+        .map_err(|_| Error::InvalidVaultPayload)
+}
+
+fn normalize_fingerprint(value: &str) -> Result<String> {
+    if value.len() != 8 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(Error::InvalidVaultPayload);
+    }
+
+    let normalized = value.to_ascii_uppercase();
+    Fingerprint::from_str(&normalized).map_err(|_| Error::InvalidVaultPayload)?;
+    Ok(normalized)
+}
+
+fn validate_master_xprv(xprv: &Xpriv) -> Result<()> {
+    if xprv.depth != 0
+        || xprv.parent_fingerprint != Fingerprint::default()
+        || xprv.child_number != (ChildNumber::Normal { index: 0 })
+    {
+        return Err(Error::NonMasterXprvPayload);
+    }
+
+    Ok(())
+}
+
+fn trim_stash_padding(encoded: &mut Vec<u8>) {
+    while encoded.last() == Some(&0) {
+        encoded.pop();
+    }
+}
+
+fn mnemonic_entropy(mnemonic: &Mnemonic) -> Result<Vec<u8>> {
+    validate_mnemonic(mnemonic)?;
 
     let entropy_len = mnemonic.word_count() / 3 * 4;
     let mut entropy = vec![0_u8; entropy_len];
@@ -387,113 +1033,40 @@ fn mnemonic_entropy(mnemonic: &Mnemonic) -> Result<Vec<u8>> {
     Ok(entropy)
 }
 
-fn encode_xprv_payload(xprv: &XprvPayload) -> Result<Zeroizing<Vec<u8>>> {
-    let xprv = Xpriv::from_str(&xprv.value).map_err(|_| Error::InvalidXprvPayload)?;
-    let private_key = Zeroizing::new(xprv.private_key.secret_bytes());
+fn validate_mnemonic(mnemonic: &Mnemonic) -> Result<()> {
+    if mnemonic.language() != Language::English {
+        return Err(Error::UnsupportedMnemonicLanguage);
+    }
 
-    let mut encoded = Zeroizing::new(Vec::with_capacity(66));
-    encoded.push(PAYLOAD_CODE_STASH);
-    encoded.push(STASH_MARKER_XPRV);
-    encoded.extend_from_slice(xprv.chain_code.as_bytes());
-    encoded.extend_from_slice(private_key.as_ref());
-    trim_stash_padding(&mut encoded);
+    let word_count = mnemonic.word_count();
+    if !matches!(word_count, 12 | 18 | 24) {
+        return Err(Error::UnsupportedMnemonicWordCount(word_count));
+    }
 
-    Ok(encoded)
+    Ok(())
 }
 
-fn is_master_xprv(xprv: &Xpriv) -> bool {
-    xprv.depth == 0
-        && xprv.parent_fingerprint == Fingerprint::default()
-        && xprv.child_number == ChildNumber::Normal { index: 0 }
-}
-
-fn decode_stash_payload(body: &[u8]) -> Result<DecodedPayload> {
-    if body.is_empty() || body.len() > STASH_LEN {
-        return Err(Error::InvalidMnemonicPayload);
+impl From<&NotesRecord> for WireNotesRecord {
+    fn from(value: &NotesRecord) -> Self {
+        match value {
+            NotesRecord::Note(note) => Self {
+                title: note.title.clone(),
+                user: None,
+                password: None,
+                site: None,
+                misc: nonempty(&note.text),
+                group: nonempty(&note.group),
+            },
+            NotesRecord::Password(password) => Self {
+                title: password.title.clone(),
+                user: Some(password.username.clone()),
+                password: nonempty(&password.password),
+                site: nonempty(&password.site),
+                misc: nonempty(&password.notes),
+                group: nonempty(&password.group),
+            },
+        }
     }
-
-    // COLDCARD strips trailing zeroes from its 72-byte stash before transport
-    let mut stash = Zeroizing::new([0_u8; STASH_LEN]);
-    stash[..body.len()].copy_from_slice(body);
-    let marker = stash[0];
-    let rest = &stash[1..];
-
-    if marker == STASH_MARKER_XPRV {
-        return decode_stash_xprv(rest);
-    }
-
-    // COLDCARD raw BIP32 master secret: marker is the byte length (16-64),
-    // body is the raw seed, and the wallet key is the BIP32 master derived
-    // from it (HMAC-SHA512 "Bitcoin seed"), matching COLDCARD's hd.from_master
-    if STASH_RAW_MASTER_SECRET_LEN.contains(&marker) {
-        let xprv = Xpriv::new_master(NetworkKind::Main, &rest[..usize::from(marker)])
-            .map_err(|_| Error::InvalidXprvPayload)?;
-        return Ok(DecodedPayload::Xprv(XprvPayload { value: xprv.to_string() }));
-    }
-
-    if marker & STASH_MARKER_MNEMONIC_FLAG == 0 {
-        return Err(Error::InvalidMnemonicPayload);
-    }
-
-    let entropy_len = usize::from((marker & STASH_MNEMONIC_ENTROPY_UNITS_MASK) + 2) * 8;
-    if !matches!(entropy_len, 16 | 24 | 32) || rest.len() < entropy_len {
-        return Err(Error::InvalidMnemonicPayload);
-    }
-
-    let mnemonic = Mnemonic::from_entropy(&rest[..entropy_len])?;
-
-    Ok(DecodedPayload::Mnemonic(mnemonic))
-}
-
-fn decode_stash_xprv(body: &[u8]) -> Result<DecodedPayload> {
-    if body.len() != 71 {
-        return Err(Error::InvalidXprvPayload);
-    }
-
-    let chain_code = &body[..32];
-    let private_key = &body[32..64];
-    SecretKey::from_slice(private_key).map_err(|_| Error::InvalidXprvPayload)?;
-
-    let mut encoded = Zeroizing::new([0_u8; 78]);
-    encoded[0..4].copy_from_slice(&MAINNET_XPRV_VERSION);
-    encoded[13..45].copy_from_slice(chain_code);
-    encoded[45] = 0;
-    encoded[46..78].copy_from_slice(private_key);
-
-    let xprv = Xpriv::decode(&encoded[..])?;
-
-    Ok(DecodedPayload::Xprv(XprvPayload { value: xprv.to_string() }))
-}
-
-fn trim_stash_padding(encoded: &mut Vec<u8>) {
-    while encoded.last() == Some(&0) {
-        encoded.pop();
-    }
-}
-
-fn decode_xprv_body(body: &[u8]) -> Result<DecodedPayload> {
-    let xprv = Xpriv::decode(body).map_err(|_| Error::InvalidXprvPayload)?;
-    if xprv.network != NetworkKind::Main {
-        return Err(Error::NonMainnetXprvPayload);
-    }
-
-    if !is_master_xprv(&xprv) {
-        return Err(Error::NonMasterXprvPayload);
-    }
-
-    Ok(DecodedPayload::Xprv(XprvPayload { value: xprv.to_string() }))
-}
-
-fn decode_notes_body(body: &[u8]) -> Result<DecodedPayload> {
-    let mut records: Vec<WireNotesRecord> =
-        serde_json::from_slice(body).map_err(|_| Error::InvalidNotesPayload)?;
-    if records.is_empty() {
-        return Err(Error::InvalidNotesPayload);
-    }
-
-    let records = records.iter_mut().map(NotesRecord::try_from).collect::<Result<Vec<_>>>()?;
-
-    Ok(DecodedPayload::Notes(NotesPayload(records)))
 }
 
 impl TryFrom<&mut WireNotesRecord> for NotesRecord {
@@ -504,242 +1077,32 @@ impl TryFrom<&mut WireNotesRecord> for NotesRecord {
             return Err(Error::InvalidNotesPayload);
         }
 
-        let is_password = record.user.is_some();
-        if !is_password && (record.password.is_some() || record.site.is_some()) {
+        let group = record.group.take().unwrap_or_default();
+        if let Some(username) = record.user.take() {
+            return PasswordRecord::new(
+                std::mem::take(&mut record.title),
+                username,
+                record.password.take().unwrap_or_default(),
+                record.site.take().unwrap_or_default(),
+                record.misc.take().unwrap_or_default(),
+                group,
+            )
+            .map(Self::Password);
+        }
+
+        if record.password.is_some() || record.site.is_some() {
             return Err(Error::InvalidNotesPayload);
         }
 
-        let group = record.group.take().unwrap_or_default();
-        if let Some(username) = record.user.take() {
-            return Ok(Self::Password(PasswordRecord {
-                title: std::mem::take(&mut record.title),
-                username,
-                password: record.password.take().unwrap_or_default(),
-                site: record.site.take().unwrap_or_default(),
-                notes: record.misc.take().unwrap_or_default(),
-                group,
-            }));
-        }
-
-        Ok(Self::Note(NoteRecord {
-            title: std::mem::take(&mut record.title),
-            text: record.misc.take().unwrap_or_default(),
+        NoteRecord::new(
+            std::mem::take(&mut record.title),
+            record.misc.take().unwrap_or_default(),
             group,
-        }))
-    }
-}
-
-fn deserialize_optional_string<'de, D>(
-    deserializer: D,
-) -> std::result::Result<Option<String>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    String::deserialize(deserializer).map(Some)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    const XPRV: &str = "xprv9s21ZrQH143K4BwRCYKSEPwcAMYweWkfKLURabnnv2GLNhJN1LSCgDQyGWyNcat72najQKwyshCBXWfHHVbcdxPAZPqByMyWDbWp5SjCfEa";
-
-    #[test]
-    fn mnemonic_stash_roundtrips_coldcard_trailing_zero_trimming() {
-        let mnemonic = Mnemonic::from_entropy(&[0_u8; 16]).unwrap();
-        let encoded = Payload::mnemonic(mnemonic.clone()).unwrap().encode().unwrap();
-
-        assert_eq!(encoded.as_slice(), &[PAYLOAD_CODE_STASH, STASH_MARKER_MNEMONIC_FLAG]);
-        assert_eq!(DecodedPayload::decode(&encoded).unwrap(), DecodedPayload::Mnemonic(mnemonic));
-    }
-
-    #[test]
-    fn xprv_encoder_uses_coldcard_stash_layout() {
-        let xprv = Xpriv::from_str(XPRV).unwrap();
-        let encoded = Payload::xprv(XPRV).unwrap().encode().unwrap();
-
-        assert_eq!(&encoded[..2], &[PAYLOAD_CODE_STASH, STASH_MARKER_XPRV]);
-        assert_eq!(&encoded[2..34], xprv.chain_code.as_bytes());
-        assert_eq!(&encoded[34..66], &xprv.private_key.secret_bytes());
-    }
-
-    #[test]
-    fn xprv_stash_decodes_after_coldcard_trims_private_key_zero() {
-        let chain_code = [2_u8; 32];
-        let mut private_key = [1_u8; 32];
-        private_key[31] = 0;
-        SecretKey::from_slice(&private_key).unwrap();
-        let mut encoded = vec![PAYLOAD_CODE_STASH, STASH_MARKER_XPRV];
-        encoded.extend_from_slice(&chain_code);
-        encoded.extend_from_slice(&private_key);
-        trim_stash_padding(&mut encoded);
-
-        let DecodedPayload::Xprv(decoded) = DecodedPayload::decode(&encoded).unwrap() else {
-            panic!("expected xprv")
-        };
-        let decoded = Xpriv::from_str(decoded.expose_string()).unwrap();
-
-        assert_eq!(decoded.chain_code.as_bytes(), &chain_code);
-        assert_eq!(decoded.private_key.secret_bytes(), private_key);
-    }
-
-    #[test]
-    fn raw_master_secret_stash_decodes_as_bip32_master() {
-        for seed_len in [16_usize, 32, 64] {
-            let seed = vec![7_u8; seed_len];
-            let mut encoded = vec![PAYLOAD_CODE_STASH, seed_len as u8];
-            encoded.extend_from_slice(&seed);
-
-            let DecodedPayload::Xprv(decoded) = DecodedPayload::decode(&encoded).unwrap() else {
-                panic!("expected xprv for seed length {seed_len}")
-            };
-            let expected = Xpriv::new_master(NetworkKind::Main, &seed).unwrap();
-
-            assert_eq!(decoded.expose_string(), expected.to_string());
-        }
-    }
-
-    #[test]
-    fn raw_master_secret_stash_restores_trimmed_trailing_zeros() {
-        let mut seed = [9_u8; 24];
-        seed[20..].fill(0);
-        let mut encoded = vec![PAYLOAD_CODE_STASH, 24];
-        encoded.extend_from_slice(&seed);
-        trim_stash_padding(&mut encoded);
-        assert!(encoded.len() < 26);
-
-        let DecodedPayload::Xprv(decoded) = DecodedPayload::decode(&encoded).unwrap() else {
-            panic!("expected xprv")
-        };
-        let expected = Xpriv::new_master(NetworkKind::Main, &seed).unwrap();
-
-        assert_eq!(decoded.expose_string(), expected.to_string());
-    }
-
-    #[test]
-    fn raw_master_secret_stash_rejects_out_of_range_lengths() {
-        for marker in [0x02_u8, 0x0f, 0x41, 0x7f] {
-            let mut encoded = vec![PAYLOAD_CODE_STASH, marker];
-            encoded.extend_from_slice(&[3_u8; 70]);
-
-            assert!(
-                matches!(DecodedPayload::decode(&encoded), Err(Error::InvalidMnemonicPayload)),
-                "marker 0x{marker:02x} should be rejected"
-            );
-        }
-    }
-
-    #[test]
-    fn full_xprv_payload_rejects_child_keys() {
-        let master = Xpriv::from_str(XPRV).unwrap();
-        let secp = bitcoin::secp256k1::Secp256k1::new();
-        let child = master.derive_priv(&secp, &[ChildNumber::Hardened { index: 7 }]).unwrap();
-        let mut payload = vec![PAYLOAD_CODE_XPRV];
-        payload.extend_from_slice(&child.encode());
-
-        assert!(matches!(DecodedPayload::decode(&payload), Err(Error::NonMasterXprvPayload)));
-    }
-
-    #[test]
-    fn full_xprv_payload_rejects_non_mainnet_keys() {
-        let testnet = Xpriv::new_master(NetworkKind::Test, &[42; 32]).unwrap();
-        let mut payload = Zeroizing::new(vec![PAYLOAD_CODE_XPRV]);
-        payload.extend_from_slice(&testnet.encode());
-
-        assert!(matches!(DecodedPayload::decode(&payload), Err(Error::NonMainnetXprvPayload)));
-    }
-
-    #[test]
-    fn decodes_quick_text_note() {
-        let decoded =
-            DecodedPayload::decode(br#"n[{"title":"Quick Note","misc":"Meet at the park"}]"#)
-                .unwrap();
-        let DecodedPayload::Notes(notes) = decoded else {
-            panic!("expected notes payload");
-        };
-        let [NotesRecord::Note(note)] = notes.records() else {
-            panic!("expected one secure note");
-        };
-
-        assert_eq!(note.title(), "Quick Note");
-        assert_eq!(note.text(), "Meet at the park");
-        assert_eq!(note.group(), "");
-    }
-
-    #[test]
-    fn decodes_note_and_password_display_fields() {
-        let decoded = DecodedPayload::decode(
-            br#"n[
-                {"title":"Recovery","misc":"stored offsite","group":"Bitcoin"},
-                {"title":"Server","user":"alice","password":"correct horse","site":"example.com","misc":"rotate yearly","group":"Work"}
-            ]"#,
         )
-        .unwrap();
-        let DecodedPayload::Notes(notes) = decoded else {
-            panic!("expected notes payload");
-        };
-        let [NotesRecord::Note(note), NotesRecord::Password(password)] = notes.records() else {
-            panic!("expected a note followed by a password");
-        };
-
-        assert_eq!(note.title(), "Recovery");
-        assert_eq!(note.text(), "stored offsite");
-        assert_eq!(note.group(), "Bitcoin");
-        assert_eq!(password.title(), "Server");
-        assert_eq!(password.username(), "alice");
-        assert_eq!(password.password(), "correct horse");
-        assert_eq!(password.site(), "example.com");
-        assert_eq!(password.notes(), "rotate yearly");
-        assert_eq!(password.group(), "Work");
+        .map(Self::Note)
     }
+}
 
-    #[test]
-    fn password_record_uses_user_field_as_protocol_discriminator() {
-        let decoded =
-            DecodedPayload::decode(br#"n[{"title":"Empty password","user":""}]"#).unwrap();
-        let DecodedPayload::Notes(notes) = decoded else {
-            panic!("expected notes payload");
-        };
-        let [NotesRecord::Password(password)] = notes.records() else {
-            panic!("expected one password record");
-        };
-
-        assert_eq!(password.username(), "");
-        assert_eq!(password.password(), "");
-    }
-
-    #[test]
-    fn rejects_malformed_notes_as_payload_errors() {
-        let malformed = [
-            &b"n\xff"[..],
-            &b"nnot-json"[..],
-            &b"n{}"[..],
-            &b"n[]"[..],
-            &br#"n[{"misc":"missing title"}]"#[..],
-            &br#"n[{"title":""}]"#[..],
-            &br#"n[{"title":"wrong type","misc":7}]"#[..],
-            &br#"n[{"title":"null field","misc":null}]"#[..],
-            &br#"n[{"title":"missing user","password":"secret"}]"#[..],
-            &br#"n[{"title":"unknown field","other":"secret"}]"#[..],
-        ];
-
-        for payload in malformed {
-            assert!(matches!(DecodedPayload::decode(payload), Err(Error::InvalidNotesPayload)));
-        }
-    }
-
-    #[test]
-    fn other_unsupported_payload_types_remain_typed() {
-        for (code, expected) in [
-            (PAYLOAD_CODE_VAULT, UnsupportedPayloadKind::Vault),
-            (PAYLOAD_CODE_PSBT, UnsupportedPayloadKind::Psbt),
-            (PAYLOAD_CODE_BACKUP, UnsupportedPayloadKind::Backup),
-            (b'?', UnsupportedPayloadKind::Unknown(b'?')),
-        ] {
-            assert!(matches!(
-                DecodedPayload::decode(&[code]),
-                Err(Error::UnsupportedPayload(kind)) if kind == expected
-            ));
-        }
-    }
+fn nonempty(value: &str) -> Option<String> {
+    (!value.is_empty()).then(|| value.to_string())
 }

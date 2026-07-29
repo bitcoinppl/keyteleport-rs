@@ -7,17 +7,23 @@ mod numeric_code;
 mod packet;
 mod password;
 mod payload;
+mod psbt;
 mod receiver;
 mod sender;
 
 pub use numeric_code::NumericCode;
-pub use packet::{Packet, PsbtPacket, ReceiverPacket, SenderPacket};
+pub use packet::{BbqrOptions, Packet, PsbtNonce, PsbtPacket, ReceiverPacket, SenderPacket};
 pub use password::TeleportPassword;
 pub use payload::{
-    DecodedPayload, NoteRecord, NotesPayload, NotesRecord, PasswordRecord, Payload,
-    UnsupportedPayloadKind, XprvPayload,
+    BackupPayload, DecryptedPayload, MasterSecret, NoteRecord, NotesPayload, NotesRecord,
+    PasswordRecord, Payload, PayloadKind, PsbtPayload, UnknownPayload, VaultPayload, VaultSecret,
+    XprvPayload, XprvWireFormat,
 };
-pub use receiver::{PendingPayload, ReceiveRequest, ReceiverSession};
+pub use psbt::{PendingPsbtPayload, PsbtReceiverSession, PsbtSendResponse, PsbtSenderSession};
+pub use receiver::{
+    DecodedTransfer, PendingPayload, ReceiveRequest, ReceiverSession, ReceiverSessionSecret,
+    RetryableError,
+};
 pub use sender::{SendResponse, SenderSession};
 
 /// A KeyTeleport operation result
@@ -50,17 +56,17 @@ pub enum Error {
     #[error("Key Teleport BBQr must use Base32 encoding")]
     InvalidBbqrEncoding,
 
+    /// The decrypted payload is empty or invalid
+    #[error("invalid KeyTeleport payload")]
+    InvalidPayload,
+
     /// The KeyTeleport URL is invalid
     #[error("invalid KeyTeleport URL")]
     InvalidUrl,
 
-    /// The payload type is valid but unsupported
-    #[error("unsupported KeyTeleport payload type {0}")]
-    UnsupportedPayload(UnsupportedPayloadKind),
-
-    /// The mnemonic payload is invalid
-    #[error("invalid mnemonic payload")]
-    InvalidMnemonicPayload,
+    /// A COLDCARD stash payload is invalid
+    #[error("invalid KeyTeleport stash payload")]
+    InvalidStashPayload,
 
     /// The mnemonic word count is unsupported
     #[error("unsupported KeyTeleport mnemonic word count {0}; expected 12, 18, or 24 words")]
@@ -70,6 +76,10 @@ pub enum Error {
     #[error("Key Teleport mnemonic payloads must use the English BIP39 word list")]
     UnsupportedMnemonicLanguage,
 
+    /// The raw master-secret length is invalid
+    #[error("invalid raw master-secret length {0}; expected 16 to 64 bytes")]
+    InvalidMasterSecretLength(usize),
+
     /// The extended private key payload is invalid
     #[error("invalid xprv payload")]
     InvalidXprvPayload,
@@ -78,13 +88,46 @@ pub enum Error {
     #[error("xprv payload is not a master key")]
     NonMasterXprvPayload,
 
-    /// The extended private key payload is not for mainnet
-    #[error("xprv payload is not a mainnet key")]
-    NonMainnetXprvPayload,
+    /// A compact stash XPRV has no network for full XPRV encoding
+    #[error("a network is required for full xprv encoding")]
+    MissingXprvNetwork,
 
     /// The Secure Notes & Passwords payload is invalid
     #[error("invalid secure notes payload")]
     InvalidNotesPayload,
+
+    /// The Seed Vault payload is invalid
+    #[error("invalid Seed Vault payload")]
+    InvalidVaultPayload,
+
+    /// The backup payload is invalid
+    #[error("invalid backup payload")]
+    InvalidBackupPayload,
+
+    /// The PSBT payload is invalid
+    #[error("invalid PSBT payload")]
+    InvalidPsbtPayload,
+
+    /// The encrypted PSBT packet is invalid
+    #[error("invalid encrypted PSBT packet")]
+    InvalidPsbtPacket,
+
+    /// The multisig PSBT nonce is outside its 28-bit range
+    #[error("invalid multisig PSBT nonce {0}")]
+    InvalidPsbtNonce(u32),
+
+    /// The derived PSBT receiver session does not match the packet nonce
+    #[error("PSBT nonce mismatch: expected {expected}, got {actual}")]
+    PsbtNonceMismatch {
+        /// The nonce used to derive the session
+        expected: u32,
+        /// The nonce carried by the packet
+        actual: u32,
+    },
+
+    /// A known payload code was used for an unknown payload
+    #[error("payload code 0x{0:02x} is already known")]
+    KnownPayloadCode(u8),
 
     /// Packet checksum verification failed
     #[error("checksum verification failed")]
@@ -109,10 +152,6 @@ pub enum Error {
     /// Base32 data is invalid
     #[error("invalid base32 data")]
     Base32(#[from] data_encoding::DecodeError),
-
-    /// Base58 data is invalid
-    #[error("invalid base58 data")]
-    Base58(#[from] bitcoin::base58::Error),
 
     /// A BIP32 key is invalid
     #[error("invalid BIP32 key")]
