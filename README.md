@@ -1,7 +1,6 @@
 # keyteleport
 
-`keyteleport` implements the
-[COLDCARD Key Teleport protocol](https://github.com/Coldcard/firmware/blob/master/docs/key-teleport.md)
+`keyteleport` implements the [COLDCARD Key Teleport protocol](https://github.com/Coldcard/firmware/blob/master/docs/key-teleport.md)
 in Rust.
 
 The crate owns the wire protocol:
@@ -18,16 +17,16 @@ Wallet policy, secret storage, scanning, signing, and user interfaces are outsid
 
 ## Protocol support
 
-| Protocol payload | Code | Send | Receive | Result |
-| --- | --- | --- | --- | --- |
-| BIP39 mnemonic | `s` | Yes | Yes | `Payload::Mnemonic` |
-| Raw BIP32 master secret | `s` | Yes | Yes | `Payload::MasterSecret` |
-| Master XPRV | `s` or `x` | Yes | Yes | `Payload::Xprv` |
-| Secure Notes & Passwords | `n` | Yes | Yes | `Payload::Notes` |
-| Seed Vault entry | `v` | Yes | Yes | `Payload::Vault` |
-| Binary PSBT | `p` | Yes | Yes | `Payload::Psbt` |
-| Full COLDCARD backup | `b` | Yes | Yes | `Payload::Backup` |
-| Future payload type | other | Yes | Yes | `Payload::Unknown` |
+| Protocol payload         | Code       | Send | Receive | Result                  |
+| ------------------------ | ---------- | ---- | ------- | ----------------------- |
+| BIP39 mnemonic           | `s`        | Yes  | Yes     | `Payload::Mnemonic`     |
+| Raw BIP32 master secret  | `s`        | Yes  | Yes     | `Payload::MasterSecret` |
+| Master XPRV              | `s` or `x` | Yes  | Yes     | `Payload::Xprv`         |
+| Secure Notes & Passwords | `n`        | Yes  | Yes     | `Payload::Notes`        |
+| Seed Vault entry         | `v`        | Yes  | Yes     | `Payload::Vault`        |
+| Binary PSBT              | `p`        | Yes  | Yes     | `Payload::Psbt`         |
+| Full COLDCARD backup     | `b`        | Yes  | Yes     | `Payload::Backup`       |
+| Future payload type      | other      | Yes  | Yes     | `Payload::Unknown`      |
 
 The crate validates PSBTs but does not sign or finalize them. Backup payloads remain secret bytes
 because backup restore policy belongs to the receiving application.
