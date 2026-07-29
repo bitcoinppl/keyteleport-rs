@@ -10,14 +10,14 @@ that Cove uses.
 
 ## Support
 
-| Protocol data            | Send                | Receive             |
-| ------------------------ | ------------------- | ------------------- |
-| English BIP39 mnemonic   | Yes                 | Yes                 |
-| Mainnet master XPRV      | Yes                 | Yes                 |
-| Secure Notes & Passwords | No                  | Yes                 |
-| Seed Vault entry         | No                  | Recognized          |
-| Full COLDCARD backup     | No                  | Recognized          |
-| Multisig PSBT            | Packet framing only | Packet framing only |
+| Protocol data            | Send                   | Receive                |
+| ------------------------ | ---------------------- | ---------------------- |
+| English BIP39 mnemonic   | ✅ Supported           | ✅ Supported           |
+| Mainnet master XPRV      | ✅ Supported           | ✅ Supported           |
+| Secure Notes & Passwords | ❌ Not supported       | ✅ Supported           |
+| Seed Vault entry         | ❌ Not supported       | ❌ Recognized only     |
+| Full COLDCARD backup     | ❌ Not supported       | ❌ Recognized only     |
+| Multisig PSBT            | ❌ Packet framing only | ❌ Packet framing only |
 
 The crate supports single-part, uncompressed Base32 BBQr packets and `keyteleport.com` URLs.
 
