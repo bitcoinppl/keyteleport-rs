@@ -34,9 +34,7 @@ backup codecs, Secure Notes encoding, or multisig PSBT encryption and decryption
 
 ## License
 
-Licensed under either of
+Licensed under either of the ones below at your option.
 
 - [Apache License, Version 2.0](LICENSE-APACHE)
 - [MIT license](LICENSE-MIT)
-
-at your option.
