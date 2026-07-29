@@ -1,5 +1,3 @@
-WIP DO NOT USE
-
 # keyteleport
 
 `keyteleport` implements the parts of the [COLDCARD Key Teleport protocol](https://github.com/Coldcard/firmware/blob/master/docs/key-teleport.md)
@@ -7,14 +5,14 @@ that Cove uses.
 
 ## Support
 
-| Protocol data | Send | Receive |
-| --- | --- | --- |
-| English BIP39 mnemonic | Yes | Yes |
-| Mainnet master XPRV | Yes | Yes |
-| Secure Notes & Passwords | No | Yes |
-| Seed Vault entry | No | Recognized |
-| Full COLDCARD backup | No | Recognized |
-| Multisig PSBT | Packet framing only | Packet framing only |
+| Protocol data            | Send                | Receive             |
+| ------------------------ | ------------------- | ------------------- |
+| English BIP39 mnemonic   | Yes                 | Yes                 |
+| Mainnet master XPRV      | Yes                 | Yes                 |
+| Secure Notes & Passwords | No                  | Yes                 |
+| Seed Vault entry         | No                  | Recognized          |
+| Full COLDCARD backup     | No                  | Recognized          |
+| Multisig PSBT            | Packet framing only | Packet framing only |
 
 The crate supports single-part, uncompressed Base32 BBQr packets and `keyteleport.com` URLs.
 
