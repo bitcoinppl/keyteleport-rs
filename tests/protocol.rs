@@ -1,0 +1,270 @@
+use std::str::FromStr as _;
+
+use bbqr::{
+    encode::Encoding,
+    file_type::FileType,
+    qr::Version,
+    split::{Split, SplitOptions},
+};
+use bip39::{Language, Mnemonic};
+use bitcoin::{
+    bip32::{ChildNumber, Xpriv},
+    secp256k1::Secp256k1,
+};
+use keyteleport::{
+    DecodedPayload, Error, NumericCode, Packet, Payload, ReceiverPacket, ReceiverSession,
+    SenderPacket, SenderSession, TeleportPassword, XprvPayload,
+};
+
+const RECEIVER_SECRET: [u8; 32] = [1; 32];
+const RECEIVER_SECRET_2: [u8; 32] = [2; 32];
+const PASSWORD_BYTES: [u8; 5] = [0x12, 0x34, 0x56, 0x78, 0x9a];
+const XPRV: &str = "xprv9s21ZrQH143K4BwRCYKSEPwcAMYweWkfKLURabnnv2GLNhJN1LSCgDQyGWyNcat72najQKwyshCBXWfHHVbcdxPAZPqByMyWDbWp5SjCfEa";
+const KEYTELEPORT_DOC_EXAMPLE: &str =
+    "https://keyteleport.com/#B$2R0100VHT2AGUUH7KUZUUSTOWOIWHJX3XM7GA2N4BHQOXDFHXLVHVA7K6ZO";
+const EXPECTED_RECEIVER_PACKET: &str =
+    "c6cc594473287ba6a0af8b6a5f5183cf51cb750d1df10c8a6cc5236fe43fc5e5dc";
+
+// fixtures generated from COLDCARD firmware testing/teleport_protocol.py at bcc2c382
+
+#[test]
+fn mnemonic_payload_roundtrips_for_supported_word_counts() {
+    for entropy_len in [16, 24, 32] {
+        let entropy = vec![0_u8; entropy_len];
+        let mnemonic = Mnemonic::from_entropy(&entropy).unwrap();
+        let decoded = roundtrip(Payload::mnemonic(mnemonic.clone()).unwrap()).unwrap();
+
+        assert_eq!(decoded, DecodedPayload::Mnemonic(mnemonic));
+    }
+}
+
+#[test]
+fn mnemonic_payload_rejects_word_counts_coldcard_cannot_encode() {
+    for entropy_len in [20, 28] {
+        let mnemonic = Mnemonic::from_entropy(&vec![0_u8; entropy_len]).unwrap();
+
+        assert!(matches!(
+            Payload::mnemonic(mnemonic),
+            Err(Error::UnsupportedMnemonicWordCount(15 | 21))
+        ));
+    }
+}
+
+#[test]
+fn mnemonic_payload_rejects_non_english_word_lists() {
+    let japanese = Mnemonic::from_entropy_in(Language::Japanese, &[0; 16]).unwrap();
+
+    assert!(matches!(Payload::mnemonic(japanese), Err(Error::UnsupportedMnemonicLanguage)));
+}
+
+#[test]
+fn ambiguous_english_words_encode_without_language_detection() {
+    let mut entropy = [0_u8; 16];
+    entropy[4] = 0x7a;
+    let mnemonic = Mnemonic::from_entropy(&entropy).unwrap();
+
+    assert!(roundtrip(Payload::mnemonic(mnemonic).unwrap()).is_ok());
+}
+
+#[test]
+fn xprv_protocol_payload_roundtrips_and_validates_base58check() {
+    let decoded = roundtrip(Payload::xprv(XPRV).unwrap()).unwrap();
+
+    match decoded {
+        DecodedPayload::Xprv(xprv) => assert_eq!(xprv.expose_string(), XPRV),
+        DecodedPayload::Mnemonic(_) | DecodedPayload::Notes(_) => panic!("expected xprv"),
+    }
+
+    assert!(matches!(
+        XprvPayload::parse("xprv9s21ZrQH143K4invalid"),
+        Err(Error::InvalidXprvPayload)
+    ));
+
+    let child = Xpriv::from_str(XPRV)
+        .unwrap()
+        .derive_priv(&Secp256k1::new(), &[ChildNumber::from_normal_idx(0).unwrap()])
+        .unwrap();
+    assert!(matches!(Payload::xprv(child.to_string()), Err(Error::NonMasterXprvPayload)));
+
+    let testnet = Xpriv::new_master(bitcoin::NetworkKind::Test, &[42; 32]).unwrap();
+    assert!(matches!(Payload::xprv(testnet.to_string()), Err(Error::NonMainnetXprvPayload)));
+}
+
+#[test]
+fn wrong_password_fails_inner_checksum_after_outer_decrypt_succeeds() {
+    let receiver = ReceiverSession::from_private_key_bytes(RECEIVER_SECRET).unwrap();
+    let request = receiver.request().unwrap();
+    let sender = SenderSession::new(&request.packet, &request.numeric_code).unwrap();
+    let response = sender.send(Payload::mnemonic(test_mnemonic_12()).unwrap()).unwrap();
+    let pending = receiver.decode_step1(&response.packet).unwrap();
+    let mut wrong_password_bytes = *response.password.expose_bytes();
+    wrong_password_bytes[0] ^= 0xff;
+    let wrong_password = TeleportPassword::from_bytes(wrong_password_bytes);
+
+    assert!(matches!(pending.complete(&wrong_password), Err(Error::Checksum)));
+}
+
+#[test]
+fn wrong_receiver_key_fails_outer_checksum_without_consuming_packet() {
+    let sender_receiver = ReceiverSession::from_private_key_bytes(RECEIVER_SECRET).unwrap();
+    let request = sender_receiver.request().unwrap();
+    let sender = SenderSession::new(&request.packet, &request.numeric_code).unwrap();
+    let response = sender.send(Payload::mnemonic(test_mnemonic_12()).unwrap()).unwrap();
+    let wrong_receiver = ReceiverSession::from_private_key_bytes(RECEIVER_SECRET_2).unwrap();
+
+    assert!(matches!(wrong_receiver.decode_step1(&response.packet), Err(Error::Checksum)));
+}
+
+#[test]
+fn receiver_session_restores_from_persisted_private_key() {
+    let original = ReceiverSession::from_private_key_bytes(RECEIVER_SECRET).unwrap();
+    let restored = ReceiverSession::from_private_key_bytes(original.private_key_bytes()).unwrap();
+
+    assert_eq!(restored.request().unwrap(), original.request().unwrap());
+}
+
+#[test]
+fn packet_constructors_enforce_protocol_boundaries() {
+    assert!(matches!(ReceiverPacket::new(vec![0; 32]), Err(Error::InvalidReceiverPacket)));
+    assert!(matches!(ReceiverPacket::new(vec![0; 34]), Err(Error::InvalidReceiverPacket)));
+    assert!(matches!(SenderPacket::new(vec![0; 37]), Err(Error::InvalidSenderPacket)));
+    assert!(matches!(SenderPacket::new(vec![0; 38]), Err(Error::InvalidSenderPacket)));
+
+    let receiver = ReceiverSession::from_private_key_bytes(RECEIVER_SECRET).unwrap();
+    let request = receiver.request().unwrap();
+    let sender = SenderSession::new(&request.packet, &request.numeric_code).unwrap();
+    let response = sender.send(Payload::mnemonic(test_mnemonic_12()).unwrap()).unwrap();
+
+    assert!(SenderPacket::new(response.packet.as_bytes().to_vec()).is_ok());
+}
+
+#[test]
+fn secret_debug_output_is_redacted() {
+    let code = NumericCode::from_str("12345678").unwrap();
+    let password = TeleportPassword::from_bytes(PASSWORD_BYTES);
+
+    assert_eq!(format!("{code:?}"), "NumericCode(****)");
+    assert_eq!(format!("{password:?}"), "TeleportPassword(****)");
+}
+
+#[test]
+fn mistyped_but_curve_valid_receiver_code_fails_at_receiver_checksum() {
+    let receiver = ReceiverSession::from_private_key_bytes(RECEIVER_SECRET).unwrap();
+    let request = receiver.request().unwrap();
+    let wrong_code = (0..100_000_000)
+        .map(|value| NumericCode::from_str(&format!("{value:08}")).unwrap())
+        .find(|code| {
+            code != &request.numeric_code && SenderSession::new(&request.packet, code).is_ok()
+        })
+        .expect("a curve-valid mistyped code should be found");
+    let sender = SenderSession::new(&request.packet, &wrong_code).unwrap();
+    let response = sender.send(Payload::mnemonic(test_mnemonic_12()).unwrap()).unwrap();
+
+    assert!(matches!(receiver.decode_step1(&response.packet), Err(Error::Checksum)));
+}
+
+#[test]
+fn coldcard_receiver_protocol_vector_matches() {
+    let receiver = ReceiverSession::from_private_key_bytes(RECEIVER_SECRET).unwrap();
+    let request = receiver.request().unwrap();
+
+    assert_eq!(request.numeric_code.as_str(), "88805930");
+    assert_eq!(hex_string(request.packet.as_bytes()), EXPECTED_RECEIVER_PACKET);
+    assert!(request.packet.to_bbqr_part().unwrap().starts_with("B$2R0100"));
+}
+
+#[test]
+fn url_parse_build_handles_case_and_rejects_invalid_fragments() {
+    let packet = Packet::from_url(KEYTELEPORT_DOC_EXAMPLE).unwrap();
+
+    match &packet {
+        Packet::Receiver(receiver) => assert_eq!(receiver.as_bytes().len(), 33),
+        _ => panic!("expected receiver packet"),
+    }
+
+    let rebuilt = packet.to_url().unwrap();
+    assert!(rebuilt.starts_with("https://keyteleport.com/#B$2R0100"));
+
+    let mixed_case_url = KEYTELEPORT_DOC_EXAMPLE.replace("keyteleport.com", "KeyTeleport.com");
+    assert!(Packet::from_url(&mixed_case_url).is_ok());
+    let raw_fragment = KEYTELEPORT_DOC_EXAMPLE.split_once('#').unwrap().1;
+    assert!(Packet::from_url(raw_fragment).is_ok());
+    for invalid in [
+        KEYTELEPORT_DOC_EXAMPLE.replace("https://", "http://"),
+        KEYTELEPORT_DOC_EXAMPLE.replace("keyteleport.com", "example.com"),
+        KEYTELEPORT_DOC_EXAMPLE.replace("keyteleport.com", "user@keyteleport.com"),
+        KEYTELEPORT_DOC_EXAMPLE.replace("keyteleport.com", "keyteleport.com:444"),
+        KEYTELEPORT_DOC_EXAMPLE.replace(".com/#", ".com/path/#"),
+        KEYTELEPORT_DOC_EXAMPLE.replace(".com/#", ".com/?x=1#"),
+        "https://keyteleport.com/#not-bbqr".into(),
+    ] {
+        assert!(Packet::from_url(&invalid).is_err(), "{invalid}");
+    }
+}
+
+#[test]
+fn packet_parser_rejects_non_ascii_without_panicking() {
+    assert!(matches!(Packet::from_bbqr_part("\u{fffd}"), Err(Error::InvalidPacket)));
+}
+
+#[test]
+fn packet_parser_rejects_non_base32_bbqr() {
+    let receiver = ReceiverSession::from_private_key_bytes(RECEIVER_SECRET).unwrap();
+    let data = receiver.request().unwrap().packet.as_bytes().to_vec();
+    let split = Split::try_from_data(
+        &data,
+        FileType::KeyTeleportReceiver,
+        SplitOptions {
+            encoding: Encoding::Hex,
+            min_split_number: 1,
+            max_split_number: 1,
+            min_version: Version::V01,
+            max_version: Version::V40,
+        },
+    )
+    .unwrap();
+
+    assert!(matches!(Packet::from_bbqr_part(&split.parts[0]), Err(Error::InvalidBbqrEncoding)));
+}
+
+#[test]
+fn password_parsing_is_case_insensitive_and_groups_for_display() {
+    let password = TeleportPassword::from_bytes(PASSWORD_BYTES);
+    let display = password.as_display_text();
+    let lowercase = display.to_ascii_lowercase();
+
+    assert_eq!(TeleportPassword::from_str(&lowercase).unwrap(), password);
+    assert_eq!(password.grouped(), "CI 2F M6 E2");
+}
+
+#[test]
+fn password_rejects_characters_outside_base32_alphabet() {
+    assert!(matches!(TeleportPassword::from_str("AAAAAAA9"), Err(Error::InvalidTeleportPassword)));
+    assert!(matches!(TeleportPassword::from_str("9AAAAAAA"), Err(Error::InvalidTeleportPassword)));
+    // 0/1/8 substitutions still map into the alphabet as OOLLBBAA
+    assert!(TeleportPassword::from_str("o0l1b8aa").is_ok());
+}
+
+#[test]
+fn receiver_code_groups_for_display() {
+    let code = NumericCode::from_str("12345678").unwrap();
+
+    assert_eq!(code.grouped(), "12 34 56 78");
+}
+
+fn roundtrip(payload: Payload) -> Result<DecodedPayload, Error> {
+    let receiver = ReceiverSession::from_private_key_bytes(RECEIVER_SECRET).unwrap();
+    let request = receiver.request().unwrap();
+    let sender = SenderSession::new(&request.packet, &request.numeric_code).unwrap();
+    let response = sender.send(payload).unwrap();
+
+    receiver.decode(&response.packet, &response.password)
+}
+
+fn test_mnemonic_12() -> Mnemonic {
+    Mnemonic::from_entropy(&[0_u8; 16]).unwrap()
+}
+
+fn hex_string(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
